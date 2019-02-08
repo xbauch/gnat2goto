@@ -225,7 +225,9 @@ package body Tree_Walk is
    with Pre  => Nkind (N) in N_Op;
 
    function Do_Op_Not (N : Node_Id) return Irep
-   with Pre => Nkind (N) in N_Op;
+     with Pre => Nkind (N) in N_Op;
+
+   function Do_Op_Concat (N : Node_Id) return Irep;
 
    procedure Do_Package_Declaration (N : Node_Id)
    with Pre => Nkind (N) = N_Package_Declaration;
@@ -1259,6 +1261,215 @@ package body Tree_Walk is
          end if;
       end if;
    end Do_RHS_Array_Assign;
+
+   ------------------
+   -- Do_Op_Concat --
+   ------------------
+
+   --  Let sum_size := \Sigma_{1\leq i\leq n} src_i.last - src_i.first + 1
+   --  T concat_expr(T src_1, T src_2, .., T src_n) {
+   --    T dest = {.first=1, .last=sum_size,
+   --              .data=(T*)malloc(sum_size*sizeof(T))};
+   --    offset_step = 0;
+   --    slice_size = src_1.last - src_1.first + 1;
+   --    memcpy(dest.data + offset_step, src_1.data, slice_size * sizeof(T));
+   --    offset_step += slice_size;
+   --
+   --    slice_size = src_2.last - src_2.first + 1;
+   --    memcpy(dest.data + offset_step, src_2.data, slice_size * sizeof(T));
+   --    offset_step += slice_size;
+   --    ...
+   --    slice_size = src_n.last - src_n.first + 1;
+   --    memcpy(dest.data + offset_step, src_n.data, slice_size * sizeof(T));
+   --    offset_step += slice_size;
+   --    return dest;
+   --  }
+   function Do_Op_Concat (N : Node_Id) return Irep
+   is
+      Source_Loc : constant Source_Ptr := Sloc (N);
+      Ret_Type : constant Irep := Make_Void_Type;
+      RHS_Arrays : constant Irep_Array := Do_RHS_Array_Assign (N);
+      Result_Type : constant Irep := Do_Type_Reference (Etype (N));
+      Concat_Params : constant Irep := New_Irep (I_Parameter_List);
+      Concat_Arguments : constant Irep := New_Irep (I_Argument_List);
+      Elem_Type_Ent : constant Entity_Id :=
+        Get_Array_Component_Type (Left_Opnd (N));
+      Element_Type : constant Irep := Do_Type_Reference (Elem_Type_Ent);
+      Index_Type : constant Irep :=
+        Do_Type_Reference (Get_Array_Index_Type (Left_Opnd (N)));
+      Function_Name : constant String := "op_concat";
+
+      function Build_Array_Params return Irep_Array;
+      function Build_Op_Concat_Body return Irep;
+      function Sum_Array_Size (Init_Size : Irep) return Irep;
+
+      function Build_Array_Params return Irep_Array
+      is
+         Result_Array : Irep_Array (RHS_Arrays'Range);
+      begin
+         for I in RHS_Arrays'Range loop
+            Result_Array (I) :=
+              Create_Fun_Parameter (Fun_Name        => Function_Name,
+                                    Param_Name      => "array_rhs",
+                                    Param_Type      => Result_Type,
+                                    Param_List      => Concat_Params,
+                                    A_Symbol_Table  => Global_Symbol_Table,
+                                    Source_Location => Source_Loc);
+         end loop;
+         return Result_Array;
+      end Build_Array_Params;
+
+      function Sum_Array_Size (Init_Size : Irep) return Irep
+      is
+         Sum_Size : Irep := Init_Size;
+      begin
+         for I in RHS_Arrays'Range loop
+            Sum_Size :=
+              Make_Op_Add (Rhs             =>
+                             Build_Array_Size (RHS_Arrays (I), Index_Type),
+                           Lhs             => Sum_Size,
+                           Source_Location => Source_Loc);
+         end loop;
+         return Sum_Size;
+      end Sum_Array_Size;
+
+      function Build_Op_Concat_Body return Irep
+      is
+         Slices : constant Irep_Array := Build_Array_Params;
+         Result_Block : constant Irep := New_Irep (I_Code_Block);
+         Dest_Symbol : constant Irep :=
+           Fresh_Var_Symbol_Expr (Result_Type, "result_dest");
+
+         PElement_Type : constant Irep :=
+           Make_Pointer_Type (Element_Type, Pointer_Type_Width);
+
+         Dest_Data : constant Irep :=
+           Make_Member_Expr (Compound         => Dest_Symbol,
+                             Source_Location  => Source_Loc,
+                             Component_Number => 0,
+                             I_Type           => PElement_Type,
+                             Component_Name   => "data");
+         Current_Offset : constant Irep :=
+           Fresh_Var_Symbol_Expr (Index_Type, "offset_step");
+
+         Void_Ptr_Type : constant Irep :=
+           Make_Pointer_Type (I_Subtype => Make_Void_Type,
+                              Width     => Pointer_Type_Width);
+         Memcpy_Lhs : constant Irep :=
+           Fresh_Var_Symbol_Expr (Void_Ptr_Type, "memcpy_lhs");
+         Zero_Hex : constant String :=
+           Convert_Uint_To_Hex (Value     => UI_From_Int (0),
+                                Bit_Width => 32);
+         Zero : constant Irep :=
+           Make_Constant_Expr (Source_Location => Source_Loc,
+                               I_Type          => Index_Type,
+                               Range_Check     => False,
+                               Value           => Zero_Hex);
+         Array_Temp_Struct : constant Irep :=
+           Make_Struct_Expr (Source_Location => Source_Loc,
+                             I_Type          => Result_Type);
+         One_Hex : constant String :=
+           Convert_Uint_To_Hex (Value     => UI_From_Int (1),
+                                Bit_Width => 32);
+         One : constant Irep :=
+           Make_Constant_Expr (Source_Location => Source_Loc,
+                               I_Type          => Index_Type,
+                               Range_Check     => False,
+                               Value           => One_Hex);
+         Dest_Size : constant Irep := Sum_Array_Size (Zero);
+         Raw_Dest_Alloc : constant Irep :=
+           Make_Malloc_Function_Call_Expr (Num_Elem          => Dest_Size,
+                                           Element_Type_Size =>
+                                             Esize (Elem_Type_Ent),
+                                           Source_Loc        => Source_Loc);
+         Dest_Alloc : constant Irep :=
+           Maybe_Typecast (Expr     => Raw_Dest_Alloc,
+                           New_Type => Make_Pointer_Type (Element_Type));
+      begin
+         Append_Struct_Member (Array_Temp_Struct, One);
+         Append_Struct_Member (Array_Temp_Struct, Dest_Size);
+         Append_Struct_Member (Array_Temp_Struct, Dest_Alloc);
+
+         Append_Declare_And_Init (Symbol     => Dest_Symbol,
+                                  Value      => Array_Temp_Struct,
+                                  Block      => Result_Block,
+                                  Source_Loc => Source_Loc);
+         Append_Op (Result_Block,
+                    Make_Code_Assign (Rhs             => Zero,
+                                      Lhs             => Current_Offset,
+                                      Source_Location => Source_Loc));
+
+         for I in Slices'Range loop
+            declare
+               Source_I_Symbol : constant Irep := Param_Symbol (Slices (I));
+               Slice_Size : constant Irep :=
+                 Build_Array_Size (Source_I_Symbol, Index_Type);
+               Slice_Size_Var : constant Irep :=
+                 Fresh_Var_Symbol_Expr (Index_Type, "slice_size");
+               Offset_Dest : constant Irep :=
+                 Make_Op_Add (Rhs             => Current_Offset,
+                              Lhs             => Dest_Data,
+                              Source_Location => Source_Loc,
+                              Overflow_Check  => False,
+                              I_Type          => PElement_Type);
+               Left_Data : constant Irep :=
+                 Make_Member_Expr (Compound         => Source_I_Symbol,
+                                   Source_Location  => Source_Loc,
+                                   Component_Number => 0,
+                                   I_Type           => PElement_Type,
+                                   Component_Name   => "data");
+               Memcpy_Fin : constant Irep :=
+                 Make_Memcpy_Function_Call_Expr (
+                                    Destination       => Offset_Dest,
+                                    Source            => Left_Data,
+                                    Num_Elem          => Slice_Size_Var,
+                                    Element_Type_Size => Esize (Elem_Type_Ent),
+                                    Source_Loc        => Source_Loc);
+               Size_Increment : constant Irep :=
+                 Make_Op_Add (Rhs             => Slice_Size_Var,
+                              Lhs             => Current_Offset,
+                              Source_Location => Source_Loc,
+                              I_Type          => Index_Type);
+            begin
+               Append_Op (Result_Block,
+                          Make_Code_Assign (Rhs             => Slice_Size,
+                                            Lhs             => Slice_Size_Var,
+                                            Source_Location => Source_Loc));
+               Append_Op (Result_Block,
+                          Make_Code_Assign (Rhs             => Memcpy_Fin,
+                                            Lhs             => Memcpy_Lhs,
+                                            Source_Location => Source_Loc));
+               Append_Op (Result_Block,
+                          Make_Code_Assign (Rhs             => Size_Increment,
+                                            Lhs             => Current_Offset,
+                                            Source_Location => Source_Loc));
+            end;
+         end loop;
+
+         return Result_Block;
+      end Build_Op_Concat_Body;
+
+      Func_Symbol : constant Symbol :=
+        Build_Function (Name           => Function_Name,
+                        RType          => Ret_Type,
+                        Func_Params    => Concat_Params,
+                        FBody          => Build_Op_Concat_Body,
+                        A_Symbol_Table => Global_Symbol_Table);
+
+      Func_Call : constant Irep :=
+        Make_Side_Effect_Expr_Function_Call (
+                                  Arguments       => Concat_Arguments,
+                                  I_Function      => Symbol_Expr (Func_Symbol),
+                                  Source_Location => Source_Loc,
+                                  I_Type          => Ret_Type);
+   begin
+      for I in RHS_Arrays'Range loop
+         Append_Argument (Concat_Arguments,
+                          RHS_Arrays (I));
+      end loop;
+
+      return Func_Call;
+   end Do_Op_Concat;
 
    ---------------------
    -- Do_Array_Length --
@@ -3509,8 +3720,7 @@ package body Tree_Walk is
    function Do_Operator_General (N : Node_Id) return Irep is
    begin
       if Nkind (N) = N_Op_Concat then
-         return Report_Unhandled_Node_Irep (N, "Do_Operator_General",
-                                            "Concat unsupported");
+         return Do_Op_Concat (N);
       elsif Nkind (N) = N_Op_Not then
          return Do_Op_Not (N);
       else
