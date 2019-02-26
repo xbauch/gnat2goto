@@ -70,6 +70,30 @@ package GOTO_Utils is
                   and then Kind (Func_Params) = I_Parameter_List
                   and then Kind (FBody) in Class_Code);
 
+   function Get_First_Index_Component (Array_Struct : Irep;
+                                       A_Symbol_Table : Symbol_Table)
+                                       return Irep;
+
+   function Get_Last_Index_Component (Array_Struct : Irep;
+                                      A_Symbol_Table : Symbol_Table)
+                                      return Irep;
+
+   function Get_Data_Component (Array_Struct : Irep;
+                                A_Symbol_Table : Symbol_Table)
+                                return Irep
+     with Pre => (Kind (Array_Struct) in Class_Expr
+                  and then Kind (Get_Type (Array_Struct)) in
+                    I_Symbol_Type | I_Struct_Type),
+     Post => Kind (Get_Type (Get_Data_Component'Result)) = I_Pointer_Type;
+
+   function Get_First_Index (Array_Struct : Irep; Source_Loc : Source_Ptr;
+                             A_Symbol_Table : Symbol_Table)
+                             return Irep
+     with Pre => (Kind (Array_Struct) in Class_Expr
+                  and then Kind (Get_Type (Array_Struct)) in
+                    I_Symbol_Type | I_Struct_Type),
+       Post => Kind (Get_First_Index'Result) = I_Member_Expr;
+
    function Build_Array_Size (Array_Comp : Irep; Idx_Type : Irep)
                               return Irep
      with Pre => (Kind (Array_Comp) in Class_Expr

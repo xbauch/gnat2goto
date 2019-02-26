@@ -4077,11 +4077,9 @@ package body Tree_Walk is
            Do_Expression (Low_Bound (Scalar_Range (Idx_Type)));
          First_Type : constant Irep := Get_Type (New_First_Expr);
          Old_First_Expr : constant Irep :=
-           Make_Member_Expr (Compound         => Base,
-                             Source_Location  => Source_Loc,
-                             Component_Number => 0,
-                             I_Type           => First_Type,
-                             Component_Name   => "first1");
+           Get_First_Index (Array_Struct => Base,
+                            Source_Loc   => Source_Loc,
+                            A_Symbol_Table => Global_Symbol_Table);
 
          New_Last_Expr : constant Irep :=
            Do_Expression (High_Bound (Scalar_Range (Idx_Type)));
